@@ -1,0 +1,17 @@
+[project]
+name = "labs-big-data-frameworks"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "p-sidrot-ece", email = "paul.sidrot@edu.ece.fr" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+labs-big-data-frameworks = "labs_big_data_frameworks:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
