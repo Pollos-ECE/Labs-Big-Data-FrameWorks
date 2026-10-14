@@ -12,7 +12,6 @@ dependencies = [
 ]
 
 [project.scripts]
-labs-big-data-frameworks = "labs_big_data_frameworks:main"
 dataset-users = "labs_big_data_frameworks.dataset_users:main"
 dataset-orders = "labs_big_data_frameworks.dataset_orders:main"
 
