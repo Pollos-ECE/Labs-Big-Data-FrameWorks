@@ -7,3 +7,9 @@ A production platform would provide credentials to a job by rotating automatical
 
 How would you turn this Job into a daily ingestion?
 => By scheduling a run everyday at the same time and being carefull to overlapping runs
+
+
+The persistent secret is stored in a file of your home directory. What are the risks, and why are they limited on Onyxia?
+
+
+The secret is visible to any process running as your user. How would you restrict the access to S3 for a Kubernetes Job?
