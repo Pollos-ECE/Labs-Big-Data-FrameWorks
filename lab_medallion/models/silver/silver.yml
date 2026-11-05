@@ -7,9 +7,18 @@ models:
         data_tests:
           - unique
           - not_null
+      - name: username_normalized
+        description: Username trimmed and lowercased, used for case-insensitive lookups.
+        data_tests:
+          - unique
+          - not_null
       - name: email
         data_tests:
           - unique
+          - not_null
+      - name: birthdate_is_valid
+        description: False when the original birthdate was later than the user's first order; the birthdate is then NULL.
+        data_tests:
           - not_null
       - name: sex
         data_tests:

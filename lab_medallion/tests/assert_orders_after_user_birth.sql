@@ -1,4 +1,3 @@
-{{ config(severity='warn') }}
 
 -- A user cannot order before being born: the test fails if this query returns rows
 select

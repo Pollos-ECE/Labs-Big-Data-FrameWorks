@@ -104,3 +104,81 @@ The orders are sorted by date. What would happen to the efficiency of the filter
 
 Compare the execution time of the CSV and Parquet queries. Which part of the difference is due to the network, which part to the parsing of the CSV file?
 =>the network part comes from the volume downloaded: the CSV query downloads the whole file (28,2 MiB) while the Parquet query only downloads the footer and two columns (203,5 KiB). The parsing part comes from the CPU work, the csv text must be read character by character and converted into types, while Parquet values are already typed and stored in binary
+
+# Lab dbt - medallion architecture
+
+## Bronze layer
+
+The bronze CSV files are left untouched. What is the benefit when a bug is found in a transformation, six months later?
+=> The bug is in the code, not in the stored data. The model is corrected and `dbt build` replays the whole history from the untouched CSV files, so six months of silver data are rebuilt correctly. If the ingestion had overwritten the raw files with cleaned ones, the original values would be gone and the error would be unrecoverable.
+
+The source reads the whole file on every query. Which other format and layout would you choose if the orders were ingested every hour for years?
+=> Parquet, partitioned by date in a Hive layout such as `orders/date=2026-11-05/`. Parquet is columnar and compressed, so a query reads only the columns it needs and benefits from predicate pushdown on row group statistics; the partitioning lets the engine prune whole directories, so a query on one month reads 30 directories instead of parsing years of CSV.
+
+## Build
+
+The silver models are views. What happens when a view is queried, and when is it preferable to a table?
+=> A view stores the SQL text in the catalog. Each query re-executes the transformation, which here means re-reading the bronze CSV files from S3 every time. A view is preferable when the result must always reflect the current source, when storage is constrained, or when the transformation is cheap compared to the cost of keeping a copy in sync. A table is preferable when the transformation is expensive and the result is read often.
+
+`UUID` values are stored in 16 bytes. How many bytes does the `VARCHAR` representation use?
+=> The canonical form is 32 hexadecimal characters plus 4 hyphens, so 36 bytes in UTF-8, plus the string overhead of the engine. That is 2.25 times the binary form, which is why the `uuid` column of the DuckDB lab compressed so poorly: hexadecimal text of random values has high entropy and nothing to dictionary-encode.
+
+## Data tests
+
+Which strategy would you choose for a dashboard displaying the age of the customers? For a dashboard displaying the sales per region?
+=> For the age dashboard the birthdate is the measured quantity, so a wrong birthdate biases the metric itself. The invalid values must be set to NULL and excluded from the average, and the share of users without a usable birthdate reported next to it. For the sales per region dashboard the birthdate is irrelevant; dropping those users would remove real orders from the regional totals. A warning on the test is enough there.
+
+The addresses associate states with random zip codes, `KY 01352` for example. Which test would detect it, and which reference data would it require?
+=> A test joining the first three digits of the ZIP code to a reference table of the prefix ranges allocated to each state, and returning the rows with no match. The reference data is the USPS ZIP code allocation. Implemented in exercise 4 as the `states` seed and the `assert_zip_code_matches_state` test, which flags 49 of the 50 generated users.
+
+## Exercises
+
+1. Add a cleaned column
+=> `username_normalized` added to `stg_users` as `lower(trim(username))`, documented in `silver.yml` and covered by `unique` and `not_null`. `unique` is the meaningful test here: it proves the normalization does not collapse two distinct usernames into one.
+
+2. Improve order validation
+=> `product` and `user_id` are already covered by the generic `accepted_values` and `relationships` tests. Strict positivity of `quantity` has no generic equivalent in dbt core, since `accepted_values` only checks a closed list, so it is written as the singular test `assert_orders_quantity_positive`. Installing `dbt_utils` would allow the generic `expression_is_true` instead, at the cost of a package dependency.
+
+3. Clean invalid birthdates
+=> `stg_users` now joins the first order date of each user, computed from `stg_orders`, and exposes `birthdate_is_valid`. The birthdate is replaced with NULL when it is later than that first order. A user with no order cannot be invalidated. 5 of the 50 users are affected, which is the source of the 288 rows that `assert_orders_after_user_birth` used to return. That test now passes without the `severity='warn'` configuration, which has been removed.
+
+4. Detect invalid ZIP codes
+=> Implemented as the `states` seed (state code, 3-digit prefix range) and the singular test `assert_zip_code_matches_state`. 49 of the 50 users fail, which is expected since the generator pairs a state with a random ZIP code.
+
+Where should this reference data come from?
+=> From the USPS, which allocates the ZIP prefixes. The seed committed here was built from a public prefix list and should be replaced by the USPS source before being trusted in production.
+
+Should it be stored as a dbt seed?
+=> Yes at this size. The table is small, changes rarely, and must be versioned together with the test that depends on it. A large or frequently updated mapping, such as a full 5-digit ZIP file, belongs in a source table loaded by the ingestion process, not in a CSV committed to git.
+
+Should the validation happen in the silver layer?
+=> The detection belongs to the tests, not to the transformation. The silver layer must not invent a state or a ZIP code: neither of the two values is more trustworthy than the other, so correcting one of them would fabricate data. The severity is a warning because the defect is upstream and cannot be fixed here.
+
+What happens when the reference data changes?
+=> The seed is versioned, so `dbt seed` reloads it and the tests are replayed. A redrawn range can turn rows that used to pass into failures, including historical rows that were correct when they were ingested. A production seed should therefore carry a validity period rather than a single current state.
+
+5. Materialization experiment
+=> Measured on this dataset: the database file holds 274432 bytes with views and 798720 bytes with tables, roughly three times more. Build times were 12.8 s and 15.7 s, which is not a meaningful difference at this scale since both runs re-read the bronze files during the tests. The configuration has been restored to `view`.
+
+Where is the data stored?
+=> With a view, only the SQL text in the DuckDB catalog; the rows stay in the CSV files on S3. With a table, the rows are copied into the DuckDB file.
+
+When is the transformation executed?
+=> At query time for a view, at build time for a table.
+
+What happens when the underlying CSV changes?
+=> The view reflects the change at the next query. The table keeps the state of the last `dbt run` and is stale until the next build.
+
+Which approach requires more storage?
+=> The table.
+
+Which approach avoids re-reading the source files for every query?
+=> The table.
+
+## Notes on the lab instructions
+
+Two blocks of the lab do not work as written on a service that has been running for a while.
+
+The `CREATE PERSISTENT SECRET` block of the DuckDB lab produces `InvalidAccessKeyId` even after the AWS profile script of the Data Storage tab has been run. The `AWS_*` environment variables injected into the container at service startup come first in DuckDB's default credential chain and are not refreshed by that script, so the secret replays expired credentials while the AWS CLI works. Adding `CHAIN 'config'` and `PROFILE 'default'` to the secret forces it to read `~/.aws` and fixes it.
+
+The `relationships` test declared on `stg_users.state` points to `ref('states')`, a model that does not exist anywhere in the lab. dbt does not fail: it parses the test and silently marks it as disabled, so it never runs. That is why the expected output of the lab counts 14 tests and not 15. The seed added in exercise 4 is named `states` with a `code` column, which makes the test run again; a full re-parse with `--no-partial-parse` is needed the first time, because the disabled state is cached by partial parsing.
