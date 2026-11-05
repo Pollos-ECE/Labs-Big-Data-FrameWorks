@@ -337,3 +337,104 @@ For each of these cases, would you choose dbt with DuckDB or Spark: a daily batc
 
 4. Append and time travel
 => One order was appended to `lab.silver.orders` with `writeTo(...).append()`: 2829 rows before, 2830 after. The table then exposes two snapshots, and `VERSION AS OF <first snapshot id>` still returns 2829 rows. The append created a new 1.9 KB data file next to the original 84 KB one, a new manifest and a `v2.metadata.json`, without touching anything written before. The Parquet directory offers nothing equivalent: appending means adding a part-file, and the only way back would be to know which files existed before, which no metadata records. An overwrite destroys the previous state outright. That is the difference between a set of files and a table format.
+
+
+# Lab Iceberg
+
+Reproduced as `lab_iceberg.py`, run with `spark-submit` in 47 s. The script reads the silver DataFrames back from the Parquet outputs of the Spark lab, so it does not depend on a live session. Note that the table `lab.silver.orders` already carried the two snapshots created in the Spark lab, which is why the counts below start above one.
+
+## Inspect the files
+
+Which files contain the actual rows?
+=> The Parquet files under `warehouse/silver/orders/data/`, and only those.
+
+Which files describe the table?
+=> Everything under `metadata/`: the `vN.metadata.json` files carrying the schema, the partition specification and the list of snapshots; the `snap-*.avro` manifest lists; the `*.avro` manifests enumerating the data files with their row counts and column statistics; and `version-hint.text`, a one-byte file naming the current version.
+
+Why does an Iceberg table need more than the Parquet files?
+=> Because a directory of Parquet files answers none of the questions a table must answer: which files belong to the table right now, what the schema is, which files a given query can skip, and what the state was before the last write. Listing a directory is not an answer: it is a point-in-time observation of a store that another writer can change between the listing and the read. The metadata turns a set of files into a table with an identity and a history.
+
+## Explore Iceberg metadata
+
+How many snapshots does the table currently have?
+=> Three at that point in the script: the two created by the Spark lab plus the one produced by the `createOrReplace` at the start of this lab. Five by the end, after the append and the insert of the schema evolution section.
+
+How many data files belong to the current table?
+=> One after the `createOrReplace`, holding the 2829 rows. Two after the append, three after the schema evolution insert, for 2833 rows and 88210 bytes in total.
+
+What information does the `snapshots` table contain that the Parquet files do not?
+=> The identifier of each version, the operation that produced it (`append`, `overwrite`, `delete`), its commit timestamp, its parent snapshot, the manifest list it points to, and the summary statistics of the write. None of this exists in a Parquet file, which knows only its own rows and its own schema, not the table it belongs to nor what came before it.
+
+## Create a second snapshot
+
+How many snapshots are there now?
+=> Four, the append having added one.
+
+Did the original Parquet files disappear?
+=> No. The data file count went from one to two: the append wrote a new file beside the first one and did not touch it. That is the condition for the previous snapshot to remain readable.
+
+Why does Iceberg create a new snapshot instead of simply replacing the table?
+=> Because replacing is not an atomic operation on an object store, and because the previous state has value. A new snapshot makes the write atomic, a single pointer swap at the end, leaves readers already in flight undisturbed, and keeps the history for an audit or a rollback. The cost is the accumulation of obsolete files, which is why Iceberg has maintenance operations to expire old snapshots.
+
+## Time travel
+
+What does time travel read?
+=> The list of data files recorded in the manifests of the requested snapshot, not the current state of the directory. `VERSION AS OF` on the first snapshot returned 2829 rows while the table held 2832 at that moment.
+
+Why can Iceberg access an older version without making a complete copy of the table?
+=> Because snapshots share their data files. A snapshot is a list of pointers, not a copy of the rows: the append added one file and produced a snapshot referencing two, the old one still referencing one. The storage cost of a version is the cost of its metadata plus the files it alone keeps alive.
+
+What would happen if the old snapshot's metadata and data files were physically deleted?
+=> Time travel to that version fails. The metadata still names files that no longer exist, so the read fails on a missing file rather than silently returning a partial result. This is precisely what `expire_snapshots` does in a controlled way: it drops the snapshots then the files nothing references any more. Deleting by hand in the bucket breaks the table.
+
+## Schema evolution
+
+Did the existing Parquet files have to be rewritten?
+=> No, and it was measured: of the two data files present before the `ALTER TABLE`, both are still referenced afterwards, and only one file was added by the insert. Reading an old file through the new schema yields NULL for the added column, which is how the grouping by `source` shows 2832 rows at NULL against 1 row at `spark`.
+
+Where is the new schema recorded?
+=> In a new `metadata.json` file, which contains the new version of the schema and keeps the previous ones. Iceberg assigns a stable identifier to each column, so a rename or a reordering does not change how the data files are read.
+
+Why is schema evolution a table-level operation rather than simply changing a Parquet file?
+=> Because a table has one schema and many files, written at different times. Changing a file would make it inconsistent with the others and with the readers. By holding the schema at table level and mapping columns by identifier, Iceberg makes the change instantaneous whatever the volume, and keeps every file written under an earlier schema readable.
+
+## Compare Iceberg with Parquet
+
+Which one is simply a collection of Parquet files?
+=> `silver/spark/orders.parquet/`: part-files and a `_SUCCESS` marker.
+
+Which one has table metadata and snapshots?
+=> `warehouse/silver/orders/`, through its `metadata/` directory.
+
+How would you safely replace a Parquet directory while another query is reading it?
+=> Not in place. The usual method is to write the new version into a separate directory and swap a pointer once the write is complete, an alias, a partition registered in a catalog, or a symbolic link, so that a reader resolves either the old path or the new one, never a mixture. Doing it without such a pointer means accepting that any concurrent reader sees an inconsistent state. The whole point of a table format is that this pointer, and the atomicity of its swap, become part of the format itself.
+
+How does Iceberg make the table state visible atomically?
+=> Every write creates new files without touching the existing ones, then the commit consists of a single operation: publishing a new `metadata.json` and updating the pointer to the current version. A reader resolves that pointer once at the start of its query and then works from an immutable file list. The write is therefore visible as a whole or not at all.
+
+Why is a catalog needed once several engines need to share the same Iceberg table?
+=> Because the engines must agree on where the current version of a table is, and must be able to commit without overwriting each other. With a `hadoop` catalog that pointer is a file in the bucket, which assumes an atomicity the object store does not always provide: two concurrent commits can silently lose one of the two. A catalog service holds the pointer transactionally, performs the swap as a compare-and-set, and in addition gives a shared namespace, name resolution independent of physical paths, and a place to enforce access control. That is the subject of the Polaris module.
+
+## Exercises
+
+1. Create `lab.silver.users` as an Iceberg table
+=> `stg_users.writeTo("lab.silver.users").createOrReplace()`, 50 rows.
+
+2. Append a new batch of users and inspect the snapshots
+=> Five users derived from existing rows, with fresh identifiers and distinguishable usernames and emails, appended: 50 rows then 55. The table then shows one more snapshot, of operation `append`.
+
+3. Query the table before and after the append using time travel
+=> `VERSION AS OF` on the first snapshot returns the row count from before the append, while the current table returns 55.
+
+4. Add a `country` column and write new data using the evolved schema
+=> `ALTER TABLE lab.silver.users ADD COLUMN country STRING`, then an insert of two rows carrying `'US'`. The grouping by `country` shows the two new rows against NULL for every row written before the change, with no rewriting of the earlier files.
+
+5. Compare the S3 layout of the users and orders tables
+=> Same structure, different scale: users ends with 3 data files for 57 rows and 14612 bytes across 4 snapshots, orders with 3 data files for 2833 rows and 88210 bytes across 5 snapshots. The ratio is instructive. The users table carries 14 KB for 57 rows, where the metadata weighs more than the data: the fixed cost of a table format is real and only amortizes with volume. This is the small-files problem that maintenance operations address.
+
+6. Explain the difference between Parquet, Iceberg, and an Iceberg catalog
+=> Parquet is a file format: it describes how the rows of one file are encoded, with its own schema and its own statistics, and knows nothing beyond itself. Iceberg is a table format: it adds, next to the data files, the metadata saying which files make up the table, under which schema, in which version, and which operation produced it, which is what gives atomic writes, time travel and schema evolution. An Iceberg catalog is the service that resolves a table name to its current metadata and arbitrates concurrent commits. Three distinct layers, each needed for the next: files, a table, then a shared namespace.
+
+## Note on the lab instructions
+
+The cleanup section asks to remove `s3://$LAB_BUCKET_NAME/warehouse/` recursively. That step was not executed: the Polaris and Trino modules both declare the Iceberg silver tables of the Spark lab as a prerequisite, and they live in that warehouse. Running the cleanup as written would require rebuilding them before the next module.
