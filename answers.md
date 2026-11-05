@@ -182,3 +182,81 @@ Two blocks of the lab do not work as written on a service that has been running 
 The `CREATE PERSISTENT SECRET` block of the DuckDB lab produces `InvalidAccessKeyId` even after the AWS profile script of the Data Storage tab has been run. The `AWS_*` environment variables injected into the container at service startup come first in DuckDB's default credential chain and are not refreshed by that script, so the secret replays expired credentials while the AWS CLI works. Adding `CHAIN 'config'` and `PROFILE 'default'` to the secret forces it to read `~/.aws` and fixes it.
 
 The `relationships` test declared on `stg_users.state` points to `ref('states')`, a model that does not exist anywhere in the lab. dbt does not fail: it parses the test and silently marks it as disabled, so it never runs. That is why the expected output of the lab counts 14 tests and not 15. The seed added in exercise 4 is named `states` with a `code` column, which makes the test run again; a full re-parse with `--no-partial-parse` is needed the first time, because the disabled state is cached by partial parsing.
+
+
+# Lab Spark RDD
+
+The lab is written for the interactive `pyspark` shell. It was reproduced as a single script, `lab_rdd.py`, run with `spark-submit --master 'local[*]'`, so that every figure quoted below is reproducible.
+
+## RDD creation and partitions
+
+What decides the number of partitions `textFile()` picks by default, for a file this size?
+=> `textFile()` asks the Hadoop input format for splits, with `minPartitions` defaulting to `min(defaultParallelism, 2)`. A file smaller than one split cannot be divided further, so the floor wins. Measured here: `defaultParallelism` is 2, and both `users.csv` (7 KB) and `orders.csv` (324 KB) give 2 partitions. For a file large enough to exceed the split size, the block size would decide instead.
+
+`repartition()` and `coalesce()` both change the partition count. Which one shuffles data, and which one doesn't?
+=> `repartition(n)` always shuffles; it is `coalesce(n, shuffle=True)`. `coalesce(n)` only merges existing partitions on the same executor and therefore cannot increase the count, which is why it is cheap: it adds a narrow dependency instead of a stage boundary.
+
+## Lazy evaluation and lineage
+
+Call `orders_data.count()` a second time. Does the Spark UI show a new stage? Why?
+=> Yes, a new job with a new stage. `orders_data` is not persisted, so the RDD holds a lineage, not data: the second action replays `textFile` and `filter` from the file. Measured 0.718 s then 0.268 s; the second run is faster only because the operating system page cache still holds the file, not because Spark reused anything.
+
+At which point in this notebook would `.cache()` change that answer?
+=> On `orders_data`, before the first `count()`. The first action would then materialize the partitions in memory and the second would read them, the stage appearing as skipped in the UI. Calling `.cache()` after the first count would still require one more full computation to populate the cache.
+
+## The cost of no schema: the multiline address
+
+Why does `spark.read.csv(multiLine=True)` not have this problem, while `sc.textFile()` does?
+=> The CSV reader keeps the quoting state across physical line breaks: a newline inside a quoted field is part of the value, and the record ends only at an unquoted line break. `textFile()` uses a byte-oriented line reader that knows nothing about quoting and cuts at every `\n`. Measured: 101 raw lines for 50 users, one header and two lines per record.
+
+In general terms, what has to be true of a file format for a line-oriented reader like `textFile()` to be safe to use on it?
+=> One record per line, and the line delimiter must never occur inside a value. The format must also be splittable at those boundaries so that a split taken anywhere in the file resumes on a record boundary. JSON Lines satisfies this; general CSV does not, and neither does pretty-printed JSON or XML.
+
+## Manual parsing of orders
+
+What would happen to this cell if one line in `orders.csv` had an extra comma inside `product`?
+=> `line.split(",")` would return six fields and the five-name unpacking would raise `ValueError` in the executor. The task fails, is retried, and the job fails. It happens at the first action that touches the offending partition, not when the RDD is defined, and nothing in the RDD API offers a quarantine for the bad row.
+
+Where does the DataFrame API perform the equivalent check, and when?
+=> In the CSV reader, at read time, against the declared or inferred schema. The `mode` option decides the outcome: `PERMISSIVE` fills the row with nulls and can keep the raw text in `_corrupt_record`, `DROPMALFORMED` discards it, `FAILFAST` fails the job. The decision is made once, declaratively, instead of being scattered in a Python function.
+
+## Key-value RDDs
+
+`reduceByKey` combines values on each partition before shuffling. What does `groupByKey` shuffle instead, and why is that more expensive?
+=> `groupByKey` shuffles every individual value and only groups them once they have crossed the network, so the shuffle carries one record per order. `reduceByKey` runs the combiner on each partition first and shuffles one partial sum per key and per partition. Here that is 2829 values against at most 50 keys times 2 partitions, a reduction of more than an order of magnitude in shuffle volume. `groupByKey` also materializes the whole group for one key on a single executor, which is what makes it fail on a skewed key.
+
+For which aggregations would `groupByKey` be unavoidable, `reduceByKey` not being able to express them?
+=> Those that are not an associative and commutative fold over the value type, that is the ones needing the whole group at once: an exact median or any other order statistic, an exact distinct count, a computation whose result depends on the order of the values. In practice `aggregateByKey` and `combineByKey` cover most of these with an accumulator of a different type than the values, so the genuinely unavoidable case is narrow, the exact quantile being the usual example.
+
+## Manual deduplication
+
+`partitionBy()` in the window function shuffles rows so every row of a given `order_id` lands on the same partition. What plays that role here?
+=> `reduceByKey` itself. It partitions by key with a `HashPartitioner` before applying the combiner, which is the same shuffle, expressed through a different API. Measured: 2829 rows before and after, the generator producing no duplicate.
+
+Which version states the intent more directly: the window function, or the `reduceByKey` with a custom combiner?
+=> The window function. It says "keep the first row per `order_id` ordered by `ordered_at` descending". The `reduceByKey` says how to fold two rows into one and leaves the reader to deduce that this amounts to keeping the most recent. It also hides an assumption: `most_recent` compares `date` as a string, which is only correct because the format is ISO 8601 and therefore lexicographically ordered.
+
+## Joining orders with users
+
+What would need to be true of how `orders_kv` and `users_kv` are partitioned for Spark to skip the shuffle?
+=> Both would have to carry the same partitioner, same class and same number of partitions, for instance after `partitionBy(HashPartitioner(n))` on each and a persist. Spark then sees a one-to-one dependency and joins partition by partition without a stage boundary. In practice only one side is usually co-partitioned, and the other is still shuffled.
+
+Replace `join()` with `leftOuterJoin()`. What changes in the result if a `user_id` in `orders` has no matching user?
+=> The order is kept, with `None` in place of the username. With `join()` it disappears without a trace, which is the dangerous behaviour: a referential integrity failure silently reduces the row count. Measured in exercise 2: 2829 rows with the inner join against 2830 with the left outer join, and a single orphan.
+
+`enriched` is not yet filtered or aggregated. What is the risk of calling `.collect()` on it directly, on a dataset much larger than this one?
+=> `collect()` brings every row back into the driver's heap. On a large dataset the driver runs out of memory, and before that the whole result crosses the network to one JVM, which also serializes a distributed computation into a single point. `take(n)` for inspection, or a write to storage for the full result, are the safe forms.
+
+## Exercises
+
+1. Rewrite `user_quantity` with `aggregateByKey`
+=> `aggregateByKey((0, 0), ...)` accumulates `(order_count, total_quantity)` in one pass, the average following by `mapValues`. The totals match those of `reduceByKey`. The point of `aggregateByKey` is that the accumulator type differs from the value type, which `reduceByKey` cannot express.
+
+2. Inject a fake `user_id` and redo the `leftOuterJoin()`
+=> One order was added with the user `00000000-0000-0000-0000-000000000000`. The inner join returns 2829 rows, the left outer join 2830, and filtering on a null username isolates exactly 1 orphan.
+
+3. Reimplement `user_quantity` with the DataFrame API
+=> `orders_df.groupBy("user_uuid").sum("quantity")` replaces the parsing function, the `map` and the `reduceByKey`, about twenty lines reduced to one. The plans are not comparable in kind: `toDebugString` lists the RDD lineage, an order of execution already fixed by the code, while `explain` shows a plan Catalyst built and optimized. The physical plan is a partial `HashAggregate`, then an `Exchange hashpartitioning(user_uuid, 200)`, then the final `HashAggregate`. The partial aggregation before the exchange is exactly the map-side combine that `reduceByKey` performs and that `groupByKey` omits: the optimizer applies it on its own, which is the real argument for the DataFrame API.
+
+4. Time the counts with and without `.cache()`
+=> Measured on this dataset: uncached 0.154 s then 0.293 s, cached 0.251 s then 0.157 s; for the aggregation, 0.287 s then 0.136 s uncached against 0.283 s then 0.189 s cached. These differences are noise. The dataset is 324 KB and already in the page cache, so the cost of serializing the partitions into the block manager is of the same order as re-reading the file. The Storage tab confirms the mechanism, the cached RDD appearing with `Memory Serialized 1x Replicated` while the other has no storage level. `cache()` pays off when recomputing the lineage is expensive, that is a wide transformation, a remote read or a costly parse, which is not the case here.
