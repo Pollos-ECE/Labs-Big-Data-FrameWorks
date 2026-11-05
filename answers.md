@@ -260,3 +260,80 @@ Replace `join()` with `leftOuterJoin()`. What changes in the result if a `user_i
 
 4. Time the counts with and without `.cache()`
 => Measured on this dataset: uncached 0.154 s then 0.293 s, cached 0.251 s then 0.157 s; for the aggregation, 0.287 s then 0.136 s uncached against 0.283 s then 0.189 s cached. These differences are noise. The dataset is 324 KB and already in the page cache, so the cost of serializing the partitions into the block manager is of the same order as re-reading the file. The Storage tab confirms the mechanism, the cached RDD appearing with `Memory Serialized 1x Replicated` while the other has no storage level. `cache()` pays off when recomputing the lineage is expensive, that is a wide transformation, a remote read or a costly parse, which is not the case here.
+
+
+# Lab Spark DataFrames - bronze to silver
+
+The lab is written for the interactive `pyspark` shell. It was reproduced as a single script, `lab_silver_spark.py`, run with `spark-submit --packages org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.11.0`, in 2 min 2 s. Environment: Spark 4.1.1, Scala 2.13.17, `hadoop-aws` 3.4.2.
+
+## SparkSession with S3 access
+
+The credentials are temporary. What happens to a running Spark job if the service is restarted mid-lab, and why?
+=> The session is built with the values of `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` read once, at startup, and copied into the Hadoop configuration. A restart issues new credentials in the environment but the running JVM keeps the old ones, so the next S3A call fails with a 403 or an expired token. Nothing recovers on its own: the session has to be recreated. A production setup would use a credentials provider that refreshes itself, not literal keys frozen in the configuration.
+
+Why does a plain `SimpleAWSCredentialsProvider` fail here, while it worked in setups without a session token?
+=> `SimpleAWSCredentialsProvider` only sends the access key and the secret key. Onyxia issues STS credentials, which are only valid when presented together with the session token: without it the server sees an access key it does not recognise as a standing one and rejects the request. `TemporaryAWSCredentialsProvider` is the provider that reads `fs.s3a.session.token` and adds it to the signature. The same mechanism explains the `InvalidAccessKeyId` met in the DuckDB lab.
+
+## Silver layer and Spark SQL
+
+Explain the output of the code that was just run.
+=> The query groups the silver users by state and counts, per state, the rows whose `city` is NULL. The states with a missing city are the military ones, `AE`, `AA` and `AP`: their second address line has the form `DPO AP 09617`, with no comma and no city, so the first regular expression finds no match. For every other state the count of missing cities is zero, which is what validates the parsing.
+
+Compare the DataFrame and SQL cells above. Which one would you choose for a one-off exploration, and which for a model reused by several colleagues? Why?
+=> SQL for the one-off exploration: it is shorter, every analyst reads it, and it needs no object to be built beforehand. The DataFrame API for a shared model: the transformation is composed of named Python values, can be factored into functions, unit tested, and typed. The decisive argument is not readability but reuse, since both compile to the same Catalyst plan, as the two cells of this lab verify by returning the same count and the same columns.
+
+`regexp_extract()` returned an empty string instead of `NULL` on no match. Where else in this notebook could that same behavior silently produce a wrong result if left unhandled?
+=> On `state` and `zip_code`, extracted by the same function and left unguarded in the lab. A military address matches them, so nothing shows here, but a malformed address would produce an empty string rather than a NULL. The consequences are the same as for `city`: an empty string forms a group of its own in a `groupBy`, is counted by `count(col)`, passes a `not_null` test, and joins against nothing in a reference table. The rule is that any `regexp_extract` whose match is not guaranteed must be wrapped in the same `when(col == "", None)`.
+
+## Write the silver layer as Parquet
+
+List the objects written under `silver/users.parquet/`. How many part-files are there, and why?
+=> One part-file, plus the `_SUCCESS` marker. Spark writes one file per partition of the DataFrame, and `stg_users` has a single partition: the source CSV is 7 KB, far below one split, and no shuffle has repartitioned it since. `stg_orders` also ends with one file even though the window function shuffled it, because the write happens after the filter on `row_number`.
+
+`coalesce(1)` before `.write` would produce a single file. What do you lose by doing that on a larger dataset?
+=> The parallelism of the write. All the data must pass through a single task, therefore a single executor, which becomes the bottleneck and may run out of memory. The reader loses as well: a single large file can still be split by Parquet row groups, but the write no longer scales. The correct way to limit the number of small files is to size the partitions, with `repartition(n)` on a sensible key, not to collapse everything to one.
+
+## Write the silver layer as Iceberg tables
+
+Compare `silver/orders.parquet/` and `warehouse/silver/orders/`. Which files hold the data, and which ones describe the table?
+=> The Parquet directory holds only data: part-files and a `_SUCCESS` marker, with no description of the whole. The Iceberg table separates the two. `data/` holds the Parquet files, here two of them, 84 KB for the initial write and 1.9 KB for the row appended in exercise 4. `metadata/` holds `v1.metadata.json` and `v2.metadata.json`, which carry the schema and the list of snapshots, two `snap-*.avro` manifest lists, two `*.avro` manifests listing the data files with their statistics, and `version-hint.text`, a one-byte file naming the current version. The data is in the same format in both cases: what Iceberg adds is the description.
+
+A second job overwrites the Parquet directory while a query is reading it. What does the reader see? What changes with an Iceberg table?
+=> On a plain directory, the reader listed the files at the start of the query and then reads them one by one. A concurrent overwrite deletes and recreates them, so the reader gets a `FileNotFoundException` or, worse, a mixture of old and new files: a result that corresponds to no consistent state of the table. With Iceberg the reader resolves `version-hint.text` once, pins a snapshot, and reads the file list of that snapshot. The writer creates new files and commits a new version; the old files are not touched until a maintenance operation expires them. The reader finishes on its snapshot and sees a coherent state.
+
+With this catalog, the pointer to the current version of a table is a file in the bucket. What can go wrong if two jobs commit at the same time, and what would a catalog service add?
+=> The `hadoop` catalog commits by writing `version-hint.text`, which assumes the object store offers an atomic rename or a conditional write. On an S3-compatible store that guarantee is not general: two jobs can read version 2, each write a version 3, and the last write wins, so one commit is lost silently. A catalog service, Polaris, Nessie, Hive Metastore or Glue, holds the pointer in a transactional store and performs the swap as a compare-and-set: the loser receives an error and retries instead of overwriting. That is exactly what the next module introduces.
+
+## Compare with the dbt lab
+
+What differs between the two schemas? Spark has no `UUID` type: what did you do about it, and what is the consequence for the consumers of the silver layer?
+=> Measured with DuckDB on the two Parquet outputs: `order_id` and `user_id` are `UUID` on the dbt side and `VARCHAR` on the Spark side, and `ordered_at` is `TIMESTAMP WITH TIME ZONE` on the dbt side against a `TIMESTAMP` without zone on the Spark side. The identifiers were cast to string, as the lab asks. The consequences are concrete: 36 bytes instead of 16 per identifier, no validation that the value is a well-formed UUID, and a join between a dbt table and a Spark table requires an explicit cast on one side. The loss of the time zone is the more dangerous of the two, since an hour read as local time rather than UTC produces a wrong result without any error.
+
+Compare the output layout: one object per model with dbt, one directory of part-files with Spark. Which one is easier for a consumer to read? Which one scales?
+=> The single object is easier: one path, one file, readable by any tool without the notion of a directory-as-table. The directory of part-files scales, because the write and the read are parallel and because adding data does not mean rewriting a single object. The single object is also a dead end on volume, since one writer produces it. This is precisely the gap an open table format fills: a directory of files plus the metadata needed to treat it as one table.
+
+The dbt lab validates the silver layer with the `unique`, `not_null`, `accepted_values` and `relationships` tests. What did this lab use instead, and what would you need to write to get the same guarantees?
+=> Four `assert` statements on row counts, nothing more: they check that no row was lost in the Parquet and Iceberg round trips, not that the content is correct. Reaching the dbt level would mean writing the equivalent checks by hand, a `count` against a `countDistinct` for `unique`, a filter on `isNull` for `not_null`, an anti-join against the expected values for `accepted_values` and against the parent table for `relationships`, and a convention for what a failure does. In other words rebuilding a small test framework, which is what dbt provides declaratively. A library such as Great Expectations or Soda fills that role for Spark.
+
+`ref()` and `source()` give dbt the dependency graph of the models. What plays this role in the notebook?
+=> Nothing explicit. The order of the cells is the dependency graph, held in the author's head and enforced only by the fact that a Python variable must exist before it is used. There is no way to ask which models depend on `stg_orders`, no lineage, and no selective re-execution of a subgraph. Spark knows the lineage of a DataFrame, which is not the same thing: it describes one computation, not a catalogue of named models.
+
+Compare the time to build the silver layer with `dbt build` and with the cells of this lab. Why are these numbers not directly comparable?
+=> `dbt build --select silver` ran in about 12 to 15 s against 2 min for this script. The comparison means nothing. The Spark figure includes the resolution and the download of the Iceberg package from Maven Central, the start of a JVM, and the writing of Parquet and Iceberg outputs that dbt does not produce, since the dbt models are views. The dbt figure, for its part, includes 22 data tests that this lab does not run. On 324 KB of data, both measure their own startup cost, not their throughput.
+
+For each of these cases, would you choose dbt with DuckDB or Spark: a daily batch of 10 GB, a daily batch of 10 TB, a team of analysts who only know SQL?
+=> 10 GB per day: dbt with DuckDB. That fits on one machine, and the JVM, the cluster and the shuffle are a cost with no counterpart. 10 TB per day: Spark, since the volume no longer fits on one node and the work must be distributed. A team of analysts who only know SQL: dbt, not for the engine but for the workflow, where a model is a `SELECT`, the dependencies are declared with `ref()`, and the tests are YAML. Spark SQL would let them write the queries but not manage a project.
+
+## Exercises
+
+1. `birthdate_is_valid` with the DataFrame API and with Spark SQL
+=> Both versions join `stg_users` to the minimum `ordered_at` per user and flag the rows whose birthdate is later than that first order. They agree: 5 invalid birthdates out of 50 users, the same 5 found by the dbt model. The difference with the dbt lab is not the result but the placement. dbt puts the rule inside the `stg_users` model, so every consumer of the silver layer gets the NULL birthdate and the flag without knowing the rule exists. Here the rule lives in a cell of a notebook, applied to a DataFrame that nothing forces a consumer to use; the Parquet and Iceberg outputs written earlier do not carry it at all.
+
+2. `zip_code` as a plain UDF and as a `pandas_udf`
+=> Measured on `users_bronze`: `regexp_extract` 0.207 s, plain Python UDF 2.244 s, `pandas_udf` 1.289 s. The built-in expression is about eleven times faster than the Python UDF. The reason is where the code runs: `regexp_extract` is a Catalyst expression evaluated in the JVM on the internal row format, with no serialization. A Python UDF forces every row out of the JVM, into a Python process, and back, one row at a time. The `pandas_udf` keeps the Python process but sends batches through Arrow, which removes the per-row round trip and recovers part of the gap without closing it. The ordering is the point; the absolute figures are small because the dataset is 50 rows and dominated by fixed costs.
+
+3. Cache the bronze DataFrames
+=> Measured on `orders_bronze`: 0.187 s then 0.178 s without cache, 0.409 s then 0.121 s with it. The first cached call is the most expensive, since it computes and stores; the second is the fastest. The storage level is `Disk Memory Deserialized 1x Replicated`. As in the RDD lab, the gain is marginal here because the dataset is 324 KB and the read is cheap. The reason to cache a bronze DataFrame read with `inferSchema=True` is stronger than these figures suggest: without a cache, each action replays the inference pass over the file in addition to the read.
+
+4. Append and time travel
+=> One order was appended to `lab.silver.orders` with `writeTo(...).append()`: 2829 rows before, 2830 after. The table then exposes two snapshots, and `VERSION AS OF <first snapshot id>` still returns 2829 rows. The append created a new 1.9 KB data file next to the original 84 KB one, a new manifest and a `v2.metadata.json`, without touching anything written before. The Parquet directory offers nothing equivalent: appending means adding a part-file, and the only way back would be to know which files existed before, which no metadata records. An overwrite destroys the previous state outright. That is the difference between a set of files and a table format.
